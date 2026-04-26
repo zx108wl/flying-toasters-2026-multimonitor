@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+*.obj
+*.o
+*.res
+*.res.o
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.tmp
+
+# Inno Setup intermediate
+*.iss.compiled
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Local dev
+*.local
+*.bak
