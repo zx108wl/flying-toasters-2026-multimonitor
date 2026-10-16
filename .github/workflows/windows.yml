@@ -1,0 +1,30 @@
+name: Windows native build and tests
+on:
+  push:
+    branches: [feature/per-monitor-scr-launcher]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified Zig 0.15.2
+        shell: pwsh
+        run: |
+          $url = 'https://ziglang.org/download/0.15.2/zig-x86_64-windows-0.15.2.zip'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP/zig.zip"
+          $hash = (Get-FileHash "$env:RUNNER_TEMP/zig.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c') { throw 'Checksum mismatch' }
+          Expand-Archive "$env:RUNNER_TEMP/zig.zip" "$env:RUNNER_TEMP/zig"
+          "$env:RUNNER_TEMP/zig/zig-x86_64-windows-0.15.2" >> $env:GITHUB_PATH
+      - name: Build, test, and package
+        shell: pwsh
+        run: |
+          ./scripts/test.ps1
+          ./scripts/package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MultiSaver-Portable
+          path: build/output/*

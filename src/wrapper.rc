@@ -15,12 +15,12 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName",      "Comunidad - Reconstruccion freeware"
-      VALUE "FileDescription",  "Flying Toasters 2026 multi-monitor wrapper"
+      VALUE "CompanyName",      "MultiSaver contributors"
+      VALUE "FileDescription",  "MultiSaver per-monitor screensaver launcher"
       VALUE "FileVersion",      "1.0.0.0"
-      VALUE "InternalName",     "flyingtoasters2026"
-      VALUE "OriginalFilename", "flyingtoasters2026.scr"
-      VALUE "ProductName",      "Flying Toasters 2026 Multi-Monitor"
+      VALUE "InternalName",     "multisaver"
+      VALUE "OriginalFilename", "multisaver.scr"
+      VALUE "ProductName",      "MultiSaver"
       VALUE "ProductVersion",   "1.0.0"
       VALUE "LegalCopyright",   "MIT License"
     END

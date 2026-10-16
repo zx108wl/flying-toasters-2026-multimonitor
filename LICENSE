@@ -24,8 +24,9 @@ THE SOFTWARE.
 ================================================================================
 
 NOTE: This MIT license applies only to the wrapper source code (src/),
-the build and packaging scripts (scripts/), and the file
-flyingtoasters2026.scr produced by compiling that source.
+the build and packaging scripts (scripts/), and the files
+flyingtoasters2026.scr and multisaver.scr produced by compiling that source.
+New documentation and configuration examples in this fork are also MIT licensed.
 
 The bundled file engine/flyingtoasters2026_engine.scr is a community
 reconstruction of a 1995 freeware screensaver and is NOT covered by this

@@ -1,17 +1,17 @@
 # Builds the wrapper .scr from src/wrapper.c using Zig.
-# Output: build/flyingtoasters2026.scr (~64 KB)
+# Output: build/multisaver.scr
 
 param(
-  [string]$Configuration = "Release"
+  [string]$ZigPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $buildDir = Join-Path $repoRoot "build"
-$outFile  = Join-Path $buildDir "flyingtoasters2026.scr"
+$outFile  = Join-Path $buildDir "multisaver.scr"
 
 # Locate Zig
-$zig = Get-Command zig -ErrorAction SilentlyContinue
+$zig = if ($ZigPath) { Get-Item -LiteralPath $ZigPath } else { Get-Command zig -ErrorAction SilentlyContinue }
 if (-not $zig) {
   $zig = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter "zig.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 }
@@ -29,7 +29,7 @@ $args = @(
   (Join-Path $src "wrapper.c"),
   (Join-Path $src "wrapper.rc"),
   "-o", $outFile,
-  "-Oz",
+  "-Oz", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
   "-target", "x86_64-windows-gnu",
   "-municode",
   "-Wl,--subsystem,windows",

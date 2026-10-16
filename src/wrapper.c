@@ -1,21 +1,15 @@
 /*
- * Flying Toasters 2026 - Multi-Monitor Wrapper (pure Win32 / C)
+ * MultiSaver - per-monitor .scr launcher, derived from Flying Toasters 2026.
  *
- * Build:
- *   zig cc wrapper.c -o flyingtoasters2026.exe \
- *     -O3 -target x86_64-windows-gnu -mwindows \
- *     -Wl,--gc-sections -ffunction-sections -fdata-sections \
- *     -lkernel32 -luser32 -lshell32 -lgdi32 -ladvapi32
- *
- * Replaces the 75 MB .NET self-contained build with a ~50 KB native exe.
+ * Build with scripts/build.ps1; see docs/BUILD.md.
  *
  * Behavior summary:
  *   /s          : enumerate every monitor, create one borderless WS_POPUP
  *                 host window per display, spawn the engine in /p HWND
  *                 mode against each.
- *   /p HWND     : forward to engine unchanged (small preview in Settings).
- *   /c[:HWND]   : forward to engine unchanged (Configure button).
- *   (no args)   : forward to engine in /c mode.
+ *   /p HWND     : preview DefaultSaver in the supplied parent window.
+ *   /c[:HWND]   : generate monitor sections and edit multisaver.ini.
+ *   (no args)   : same as /c.
  *
  * On any keypress, mouse click, wheel, or mouse movement (>6 px after a
  * 750 ms dead zone), the wrapper kills every spawned engine process and
@@ -36,9 +30,9 @@
 #include <stdint.h>
 #include <wchar.h>
 
-#define ENGINE_FILENAME    L"flyingtoasters2026_engine.scr"
-#define APP_TITLE          L"Flying Toasters 2026"
-#define MUTEX_NAME         L"Local\\FlyingToasters2026_Wrapper_Singleton"
+#define INI_FILENAME       L"multisaver.ini"
+#define APP_TITLE          L"MultiSaver"
+#define MUTEX_NAME         L"Local\\MultiSaver_Singleton"
 #define WND_CLASS_NAME     L"FlyingToasters2026SaverHost"
 
 #define MAX_MONITORS       32
@@ -62,7 +56,78 @@ static POINT             g_startMouse     = { 0, 0 };
 static DWORD             g_startedTick    = 0;
 static volatile LONG     g_exiting        = 0;
 
+static WCHAR g_directory[MAX_PATH], g_ini[MAX_PATH];
+static WCHAR g_paths[MAX_MONITORS][MAX_PATH];
+static HANDLE g_job;
+static int g_cursorHidden;
+static int g_result = 1;
 static HWND              g_hosts[MAX_MONITORS];
+
+/* Device interface names survive changes to GDI DISPLAY numbers. Do not
+ * silently fall back to an ordinal when the driver exposes no identity. */
+static BOOL MonitorId(HMONITOR monitor, WCHAR *id, size_t count)
+{
+    MONITORINFOEXW mi = {0};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, (MONITORINFO *)&mi)) return FALSE;
+    DISPLAY_DEVICEW device = {0};
+    device.cb = sizeof(device);
+    for (DWORD i = 0; EnumDisplayDevicesW(mi.szDevice, i, &device,
+                                         EDD_GET_DEVICE_INTERFACE_NAME); ++i) {
+        if ((device.StateFlags & DISPLAY_DEVICE_ACTIVE) && device.DeviceID[0]) {
+            return swprintf(id, count, L"Monitor:%ls", device.DeviceID) > 0;
+        }
+        ZeroMemory(&device, sizeof(device));
+        device.cb = sizeof(device);
+    }
+    return FALSE;
+}
+
+static BOOL SaverPath(LPCWSTR section, WCHAR *result)
+{
+    WCHAR out[MAX_PATH];
+    result[0] = 0;
+    WCHAR value[MAX_PATH], fallback[MAX_PATH], expanded[MAX_PATH], combined[MAX_PATH * 2];
+    GetPrivateProfileStringW(L"Launcher", L"DefaultSaver", L"", value,
+                             MAX_PATH, g_ini);
+    wcscpy(fallback, value);
+    if (section) GetPrivateProfileStringW(section, L"Saver", fallback, value,
+                                          MAX_PATH, g_ini);
+    if (!value[0]) wcscpy(value, fallback);
+    if (!value[0] || !_wcsicmp(value, L"none")) return FALSE;
+    DWORD n = ExpandEnvironmentStringsW(value, expanded, MAX_PATH);
+    if (!n || n > MAX_PATH || wcschr(expanded, L'"')) return FALSE;
+    if (expanded[0] == L'\\' || (expanded[0] && expanded[1] == L':')) {
+        wcscpy(combined, expanded);
+    } else {
+        if (swprintf(combined, _countof(combined), L"%ls\\%ls",
+                     g_directory, expanded) < 0) return FALSE;
+    }
+    n = GetFullPathNameW(combined, MAX_PATH, out, NULL);
+    if (!n || n >= MAX_PATH) return FALSE;
+    WCHAR *ext = wcsrchr(out, L'.');
+    if (!ext || _wcsicmp(ext, L".scr")) return FALSE;
+    DWORD attr = GetFileAttributesW(out);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return FALSE;
+    /* Reject self, including hard links and symbolic links. */
+    WCHAR self[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, self, MAX_PATH)) return FALSE;
+    HANDLE a = CreateFileW(out, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                          FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE b = CreateFileW(self, 0, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                          FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    BY_HANDLE_FILE_INFORMATION ai, bi;
+    BOOL valid = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandle(a, &ai) && GetFileInformationByHandle(b, &bi);
+    if (valid && ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber &&
+        ai.nFileIndexHigh == bi.nFileIndexHigh &&
+        ai.nFileIndexLow == bi.nFileIndexLow) valid = FALSE;
+    if (a != INVALID_HANDLE_VALUE) CloseHandle(a);
+    if (b != INVALID_HANDLE_VALUE) CloseHandle(b);
+    if (valid) wcscpy(result, out);
+    return valid;
+}
 static int               g_hostCount      = 0;
 static HANDLE            g_engineHandles[MAX_MONITORS];
 static int               g_engineCount    = 0;
@@ -82,6 +147,7 @@ static LRESULT CALLBACK MouseLLProc(int nCode, WPARAM wParam, LPARAM lParam)
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
+        case WM_MOUSEHWHEEL:
         case WM_MOUSEWHEEL:
         case WM_XBUTTONDOWN:
             TriggerExit();
@@ -90,8 +156,8 @@ static LRESULT CALLBACK MouseLLProc(int nCode, WPARAM wParam, LPARAM lParam)
             DWORD now = GetTickCount();
             if (now - g_startedTick < INITIAL_QUIET_MS) break;
             MSLLHOOKSTRUCT *m = (MSLLHOOKSTRUCT *)lParam;
-            int dx = m->pt.x - g_startMouse.x;
-            int dy = m->pt.y - g_startMouse.y;
+            LONGLONG dx = (LONGLONG)m->pt.x - g_startMouse.x;
+            LONGLONG dy = (LONGLONG)m->pt.y - g_startMouse.y;
             if (dx * dx + dy * dy >
                 MOVE_DEAD_ZONE_PX * MOVE_DEAD_ZONE_PX) {
                 TriggerExit();
@@ -122,6 +188,7 @@ static LRESULT CALLBACK SaverWndProc(HWND hwnd, UINT msg,
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
+    case WM_MOUSEHWHEEL:
     case WM_MOUSEWHEEL:
         TriggerExit();
         return 0;
@@ -135,6 +202,8 @@ static LRESULT CALLBACK SaverWndProc(HWND hwnd, UINT msg,
         FillRect(hdc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
         return 1;
     }
+    case WM_DISPLAYCHANGE:
+    case WM_CLOSE:
     case WM_DESTROY:
         TriggerExit();
         return 0;
@@ -148,6 +217,11 @@ static BOOL CALLBACK EnumMonitorsProc(HMONITOR hMon, HDC hdc,
     (void)hdc; (void)lprcMon; (void)lParam;
     if (g_hostCount >= MAX_MONITORS) return TRUE;
 
+    WCHAR id[160];
+    if (MonitorId(hMon, id, _countof(id)))
+        SaverPath(id, g_paths[g_hostCount]);
+    else
+        SaverPath(NULL, g_paths[g_hostCount]);
     MONITORINFO mi = { sizeof(mi) };
     if (!GetMonitorInfoW(hMon, &mi)) return TRUE;
 
@@ -170,22 +244,16 @@ static BOOL CALLBACK EnumMonitorsProc(HMONITOR hMon, HDC hdc,
 
 /* ------------------------------------------------------------------ */
 
-static BOOL ResolveEnginePath(LPWSTR out, size_t out_chars)
+static BOOL InitPaths(void)
 {
-    WCHAR exePath[MAX_PATH];
-    DWORD n = GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return FALSE;
-
-    WCHAR *p = wcsrchr(exePath, L'\\');
-    if (!p) return FALSE;
-    *p = 0;
-
-    int written = swprintf(out, out_chars, L"%ls\\%ls",
-                           exePath, ENGINE_FILENAME);
-    if (written < 0 || (size_t)written >= out_chars) return FALSE;
-    return TRUE;
+    DWORD n = GetModuleFileNameW(NULL, g_directory, MAX_PATH);
+    if (!n || n >= MAX_PATH) return FALSE;
+    WCHAR *slash = wcsrchr(g_directory, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    int written = swprintf(g_ini, MAX_PATH, L"%ls\\%ls", g_directory, INI_FILENAME);
+    return written > 0 && written < MAX_PATH;
 }
-
 static HANDLE SpawnEngine(const wchar_t *enginePath, const wchar_t *args)
 {
     WCHAR cmdLine[MAX_PATH * 2 + 64];
@@ -198,8 +266,17 @@ static HANDLE SpawnEngine(const wchar_t *enginePath, const wchar_t *args)
     PROCESS_INFORMATION pi = { 0 };
 
     if (!CreateProcessW(enginePath, cmdLine, NULL, NULL, FALSE,
-        0, NULL, NULL, &si, &pi)) {
+        g_job ? CREATE_SUSPENDED : 0, NULL, g_directory, &si, &pi)) {
         return NULL;
+    }
+    if (g_job) {
+        if (!AssignProcessToJobObject(g_job, pi.hProcess) ||
+            ResumeThread(pi.hThread) == (DWORD)-1) {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return NULL;
+        }
     }
     CloseHandle(pi.hThread);
     return pi.hProcess;
@@ -209,18 +286,29 @@ static void EnableDpiAwareness(void)
 {
     HMODULE u32 = GetModuleHandleW(L"user32.dll");
     if (!u32) return;
-    PFN_SetProcessDpiAwarenessContext pSetCtx =
-        (PFN_SetProcessDpiAwarenessContext)
-        GetProcAddress(u32, "SetProcessDpiAwarenessContext");
-    if (pSetCtx) {
-        if (pSetCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return;
+    union {
+        FARPROC generic;
+        PFN_SetProcessDpiAwarenessContext typed;
+    } proc;
+    proc.generic = GetProcAddress(u32, "SetProcessDpiAwarenessContext");
+    if (proc.typed) {
+        if (proc.typed(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return;
     }
     SetProcessDPIAware();
 }
 
+static BOOL CreateChildJob(void)
+{
+    g_job = CreateJobObjectW(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    return g_job && SetInformationJobObject(g_job, JobObjectExtendedLimitInformation,
+                                           &limits, sizeof(limits));
+}
+
 /* ------------------------------------------------------------------ */
 
-static int RunFullscreen(const wchar_t *enginePath)
+static int RunFullscreen(void)
 {
     /* Singleton */
     HANDLE mutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
@@ -246,8 +334,11 @@ static int RunFullscreen(const wchar_t *enginePath)
 
     if (!RegisterClassExW(&wc)) goto cleanup;
 
+    if (!CreateChildJob()) goto cleanup;
+
     /* Hide cursor (counter-based, may need multiple decrements). */
     while (ShowCursor(FALSE) >= 0) { /* loop until counter < 0 */ }
+    g_cursorHidden = 1;
 
     /* Create one host per monitor */
     EnumDisplayMonitors(NULL, NULL, EnumMonitorsProc, 0);
@@ -258,7 +349,7 @@ static int RunFullscreen(const wchar_t *enginePath)
         WCHAR args[64];
         swprintf(args, _countof(args), L"/p %llu",
                  (unsigned long long)(uintptr_t)g_hosts[i]);
-        HANDLE h = SpawnEngine(enginePath, args);
+        HANDLE h = g_paths[i][0] ? SpawnEngine(g_paths[i], args) : NULL;
         if (h && g_engineCount < MAX_MONITORS) {
             g_engineHandles[g_engineCount++] = h;
         }
@@ -268,6 +359,9 @@ static int RunFullscreen(const wchar_t *enginePath)
     HINSTANCE hInst = GetModuleHandleW(NULL);
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL,    MouseLLProc, hInst, 0);
     g_kbHook    = SetWindowsHookExW(WH_KEYBOARD_LL, KbLLProc,    hInst, 0);
+
+    if (!g_mouseHook || !g_kbHook) goto cleanup;
+    g_result = 0;
 
     /* Message loop */
     MSG msg;
@@ -280,6 +374,8 @@ static int RunFullscreen(const wchar_t *enginePath)
 cleanup:
     if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = NULL; }
     if (g_kbHook)    { UnhookWindowsHookEx(g_kbHook);    g_kbHook    = NULL; }
+
+    if (g_job) { CloseHandle(g_job); g_job = NULL; }
 
     /* Kill engines */
     for (int i = 0; i < g_engineCount; i++) {
@@ -298,48 +394,81 @@ cleanup:
         if (IsWindow(g_hosts[i])) DestroyWindow(g_hosts[i]);
     }
 
-    while (ShowCursor(TRUE) < 0) { /* restore counter */ }
+    if (g_cursorHidden) while (ShowCursor(TRUE) < 0) { /* restore counter */ }
 
-    ReleaseMutex(mutex);
+
     CloseHandle(mutex);
-    return 0;
+    return g_result;
 }
 
 static int RunPreview(const wchar_t *enginePath, const wchar_t *hwndArg)
 {
+    EnableDpiAwareness();
+    if (!CreateChildJob()) {
+        if (g_job) { CloseHandle(g_job); g_job = NULL; }
+        return 1;
+    }
     WCHAR args[64];
     swprintf(args, _countof(args), L"/p %ls",
              (hwndArg && *hwndArg) ? hwndArg : L"0");
     HANDLE h = SpawnEngine(enginePath, args);
-    if (!h) return 1;
-    WaitForSingleObject(h, INFINITE);
-    DWORD code = 0;
-    GetExitCodeProcess(h, &code);
-    CloseHandle(h);
-    return (int)code;
-}
-
-static int RunConfig(const wchar_t *enginePath, const wchar_t *hwndArg)
-{
-    WCHAR args[64];
-    if (hwndArg && *hwndArg) {
-        swprintf(args, _countof(args), L"/c:%ls", hwndArg);
-    } else {
-        wcscpy(args, L"/c");
+    if (!h) { CloseHandle(g_job); g_job = NULL; return 1; }
+    HWND parent = (HWND)(uintptr_t)wcstoull(hwndArg, NULL, 10);
+    while (WaitForSingleObject(h, 100) == WAIT_TIMEOUT) {
+        if (!IsWindow(parent)) break;
     }
-    HANDLE h = SpawnEngine(enginePath, args);
-    if (!h) return 1;
-    WaitForSingleObject(h, INFINITE);
+    CloseHandle(g_job);
+    g_job = NULL;
+    WaitForSingleObject(h, 1500);
     DWORD code = 0;
     GetExitCodeProcess(h, &code);
     CloseHandle(h);
     return (int)code;
 }
 
-static void ShowError(LPCWSTR text)
+static BOOL CALLBACK AddMonitorConfig(HMONITOR mon, HDC dc, LPRECT rect, LPARAM arg)
 {
-    MessageBoxW(NULL, text, APP_TITLE L" (wrapper)",
-                MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
+    (void)dc; (void)rect; (void)arg;
+    WCHAR id[160], value[MAX_PATH];
+    if (MonitorId(mon, id, _countof(id))) {
+        GetPrivateProfileStringW(id, L"Saver", L"<missing>", value, MAX_PATH, g_ini);
+        if (!wcscmp(value, L"<missing>"))
+            if (!WritePrivateProfileStringW(id, L"Saver", L"", g_ini)) return FALSE;
+        MONITORINFOEXW mi = {0};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, (MONITORINFO *)&mi)) {
+            swprintf(value, MAX_PATH, L"%ls: %ldx%ld at (%ld,%ld)%ls", mi.szDevice,
+                mi.rcMonitor.right - mi.rcMonitor.left,
+                mi.rcMonitor.bottom - mi.rcMonitor.top,
+                mi.rcMonitor.left, mi.rcMonitor.top,
+                (mi.dwFlags & MONITORINFOF_PRIMARY) ? L" primary" : L"");
+            if (!WritePrivateProfileStringW(id, L"Info", value, g_ini)) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static int RunConfig(void)
+{
+    /* Seed a UTF-16 INI so non-ASCII paths round-trip through profile APIs. */
+    if (GetFileAttributesW(g_ini) == INVALID_FILE_ATTRIBUTES) {
+        HANDLE f = CreateFileW(g_ini, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE) return 2;
+        static const WCHAR initial[] = L"\xFEFF; MultiSaver: blank Saver inherits DefaultSaver; none is black.\r\n[Launcher]\r\nDefaultSaver=\r\n";
+        DWORD written;
+        BOOL ok = WriteFile(f, initial, sizeof(initial) - sizeof(WCHAR), &written, NULL);
+        CloseHandle(f);
+        if (!ok || written != sizeof(initial) - sizeof(WCHAR)) return 2;
+    }
+    if (!EnumDisplayMonitors(NULL, NULL, AddMonitorConfig, 0)) return 2;
+    WCHAR editor[MAX_PATH];
+    if (!GetSystemDirectoryW(editor, MAX_PATH - 13)) return 2;
+    wcscat(editor, L"\\notepad.exe");
+    WCHAR args[MAX_PATH + 4];
+    swprintf(args, _countof(args), L"\"%ls\"", g_ini);
+    return (INT_PTR)ShellExecuteW(NULL, L"open", editor, args, g_directory,
+                                  SW_SHOWNORMAL) > 32 ? 0 : 2;
 }
 
 /* ------------------------------------------------------------------ */
@@ -378,30 +507,33 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
     }
 
     WCHAR enginePath[MAX_PATH];
-    if (!ResolveEnginePath(enginePath, MAX_PATH)) {
-        ShowError(L"No se puede determinar la ruta del wrapper.");
+    if (!InitPaths()) {
         if (argv) LocalFree(argv);
         return 2;
     }
-
-    DWORD attrs = GetFileAttributesW(enginePath);
-    if (attrs == INVALID_FILE_ATTRIBUTES ||
-        (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        WCHAR msg[MAX_PATH + 256];
-        swprintf(msg, _countof(msg),
-            L"No se encuentra el motor del salvapantallas:\n%ls\n\n"
-            L"El wrapper espera un archivo llamado '" ENGINE_FILENAME
-            L"' en su misma carpeta.", enginePath);
-        ShowError(msg);
+    if (mode == 2 && !SaverPath(NULL, enginePath)) {
         if (argv) LocalFree(argv);
         return 2;
     }
-
+    if (mode == 2) {
+        WCHAR *end = NULL;
+        unsigned long long handle = param ? wcstoull(param, &end, 10) : 0;
+        if (!handle || !end || *end || handle > UINTPTR_MAX ||
+            !IsWindow((HWND)(uintptr_t)handle)) {
+            if (argv) LocalFree(argv);
+            return 2;
+        }
+    }
     int rc;
     switch (mode) {
-    case 1:  rc = RunFullscreen(enginePath);          break;
+    case 1:  rc = RunFullscreen();          break;
     case 2:  rc = RunPreview(enginePath, param);      break;
-    default: rc = RunConfig(enginePath, param);       break;
+    default:
+        rc = RunConfig();
+        if (rc) MessageBoxW(NULL,
+            L"Could not create or edit multisaver.ini. Keep the launcher in a writable folder.",
+            APP_TITLE, MB_OK | MB_ICONERROR);
+        break;
     }
 
     if (argv) LocalFree(argv);
